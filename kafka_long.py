@@ -1,192 +1,182 @@
-import sys
-from pyspark.sql import SparkSession
+import logging
+from pyspark.sql import SparkSession, DataFrame
 from pyspark.sql.functions import (
-    from_json, col, window, count, sum as spark_sum
+    from_json,
+    col,
+    window,
+    count,
+    sum as sum_,
 )
-from pyspark.sql.types import (
-    StructType, StructField, StringType, DecimalType, TimestampType
-)
-from pyspark.sql.streaming import StreamingQuery, StreamingQueryException
+from pyspark.sql.types import StructType, StructField, StringType, DecimalType, TimestampType
 
-def create_spark_session(app_name: str = "HighVolumeTransactionProcessor") -> SparkSession:
-    """
-    Create or retrieve an existing SparkSession.
+logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(asctime)s %(message)s')
 
-    :param app_name: Name for the Spark application.
-    :return: A SparkSession instance.
+def get_spark_session(app_name: str = "HighVolumeTransactionAnalysis") -> SparkSession:
     """
-    return SparkSession.builder \
-        .appName(app_name) \
+    Creates or retrieves an existing SparkSession.
+    """
+    return (
+        SparkSession.builder
+        .appName(app_name)
         .getOrCreate()
+    )
 
-
-def define_schema() -> StructType:
+def get_transaction_schema() -> StructType:
     """
-    Define schema for transaction data.
-
-    :return: A StructType object representing the schema.
+    Defines the schema for the transaction data.
     """
     return StructType([
-        StructField("transaction_id", StringType(), True),
-        StructField("user_id", StringType(), True),
-        StructField("amount", DecimalType(10, 2), True),
-        StructField("timestamp", TimestampType(), True)
+        StructField("transaction_id", StringType(), nullable=True),
+        StructField("user_id", StringType(), nullable=True),
+        StructField("amount", DecimalType(10, 2), nullable=True),
+        StructField("timestamp", TimestampType(), nullable=True)
     ])
 
-
-def read_stream_from_kafka(
+def read_raw_transactions(
     spark: SparkSession,
-    kafka_bootstrap_servers: str,
-    input_topic: str,
-    schema: StructType,
-    watermark_threshold: str = "5 minutes"
-):
+    bootstrap_servers: str = "kafka:9092",
+    input_topic: str = "raw_transactions"
+) -> DataFrame:
     """
-    Read streaming data from Kafka and parse it using the provided schema.
-
-    :param spark: SparkSession object.
-    :param kafka_bootstrap_servers: Kafka bootstrap servers, e.g. "kafka:9092".
-    :param input_topic: Kafka topic to read from.
-    :param schema: Schema for parsing the incoming JSON data.
-    :param watermark_threshold: Watermark threshold for late data.
-    :return: A parsed DataFrame representing the streaming data.
+    Reads the raw streaming transactions from Kafka.
+    
+    :param spark: SparkSession instance.
+    :param bootstrap_servers: Kafka broker(s).
+    :param input_topic: Kafka topic to subscribe to for raw transactions.
+    :return: A streaming DataFrame of raw transactions.
     """
-    raw_stream = (
+    logging.info("Reading raw transactions from Kafka topic: %s", input_topic)
+    return (
         spark.readStream
         .format("kafka")
-        .option("kafka.bootstrap.servers", kafka_bootstrap_servers)
+        .option("kafka.bootstrap.servers", bootstrap_servers)
         .option("subscribe", input_topic)
         .load()
     )
 
-    parsed_stream = (
-        raw_stream
+def parse_transactions(raw_df: DataFrame, schema: StructType, watermark: str = "5 minutes") -> DataFrame:
+    """
+    Parses raw Kafka data into structured columns using the given schema 
+    and applies watermarking for late data.
+
+    :param raw_df: The raw DataFrame read from Kafka.
+    :param schema: The schema to parse the JSON data.
+    :param watermark: Watermark duration for handling late data.
+    :return: A DataFrame with parsed and timestamp-watermarked transaction data.
+    """
+    logging.info("Parsing raw transaction data and applying watermark of %s", watermark)
+    return (
+        raw_df
         .select(
             from_json(col("value").cast("string"), schema).alias("data")
         )
         .select("data.*")
-        .withWatermark("timestamp", watermark_threshold)
+        .withWatermark("timestamp", watermark)
     )
 
-    return parsed_stream
-
-
-def process_risk_analysis(parsed_stream):
+def detect_high_risk_transactions(
+    parsed_df: DataFrame,
+    tx_count_threshold: int = 10,
+    amount_threshold: float = 10000.0
+) -> DataFrame:
     """
-    Identify high-volume or high-amount transactions using Spark aggregations.
+    Performs aggregation to detect high-risk transactions based on transaction 
+    count and total amount within a time window.
 
-    :param parsed_stream: Parsed DataFrame from Kafka source.
-    :return: DataFrame with potential risk alerts.
+    :param parsed_df: Parsed DataFrame with columns [transaction_id, user_id, amount, timestamp].
+    :param tx_count_threshold: The threshold for transaction count in a given window.
+    :param amount_threshold: The threshold for total transaction amount in a given window.
+    :return: A DataFrame of high-risk transactions for the specified window and user.
     """
-    risk_analysis = (
-        parsed_stream
-        .groupBy(
-            window(col("timestamp"), "1 minute"),
-            col("user_id")
-        )
+    logging.info(
+        "Detecting high-risk transactions (tx_count > %d or total_amount > %f)",
+        tx_count_threshold,
+        amount_threshold
+    )
+    return (
+        parsed_df
+        .groupBy(window(col("timestamp"), "1 minute"), col("user_id"))
         .agg(
             count("*").alias("tx_count"),
-            spark_sum("amount").alias("total_amount")
+            sum_("amount").alias("total_amount")
         )
-        .where("tx_count > 10 OR total_amount > 10000")
+        .where((col("tx_count") > tx_count_threshold) | (col("total_amount") > amount_threshold))
     )
-    return risk_analysis
 
-
-def write_stream_to_kafka(
-    df,
-    kafka_bootstrap_servers: str,
-    output_topic: str,
-    checkpoint_location: str
-) -> StreamingQuery:
+def write_high_risk_transactions(
+    risk_df: DataFrame,
+    bootstrap_servers: str = "kafka:9092",
+    output_topic: str = "risk_alerts",
+    checkpoint_path: str = "/checkpoints/risk_alerts"
+):
     """
-    Write the result DataFrame back to a Kafka topic.
+    Writes the high-risk transactions to a Kafka topic.
 
-    :param df: DataFrame to write out.
-    :param kafka_bootstrap_servers: Kafka bootstrap servers.
-    :param output_topic: Kafka topic to write to.
-    :param checkpoint_location: HDFS/S3 path for checkpointing.
-    :return: A StreamingQuery object.
+    :param risk_df: DataFrame containing the identified high-risk transactions.
+    :param bootstrap_servers: Kafka broker(s).
+    :param output_topic: Kafka topic for publishing high-risk transactions.
+    :param checkpoint_path: Filesystem path for checkpoint data.
+    :return: StreamingQuery object representing the streaming write process.
     """
-    query = (
-        df.writeStream
+    logging.info("Writing high-risk transactions to Kafka topic: %s", output_topic)
+    return (
+        risk_df
+        .writeStream
         .format("kafka")
-        .option("kafka.bootstrap.servers", kafka_bootstrap_servers)
+        .option("kafka.bootstrap.servers", bootstrap_servers)
         .option("topic", output_topic)
-        .option("checkpointLocation", checkpoint_location)
+        .option("checkpointLocation", checkpoint_path)
         .start()
     )
-    return query
-
 
 def process_high_volume_transactions(
-    kafka_bootstrap_servers="kafka:9092",
-    input_topic="raw_transactions",
-    output_topic="risk_alerts",
-    checkpoint_location="/checkpoints/risk_alerts"
-) -> StreamingQuery:
+    bootstrap_servers: str = "kafka:9092",
+    input_topic: str = "raw_transactions",
+    output_topic: str = "risk_alerts",
+    checkpoint_path: str = "/checkpoints/risk_alerts"
+):
     """
-    Orchestrates the entire workflow of reading, processing, and writing
-    high-volume transactions. Returns a StreamingQuery which can be awaited
-    or monitored.
+    Main entry point that orchestrates the entire flow:
+      1. Read from Kafka
+      2. Parse transactions
+      3. Detect high-risk transactions
+      4. Publish results to a Kafka 'risk alerts' topic
 
-    :param kafka_bootstrap_servers: Kafka bootstrap servers.
-    :param input_topic: Topic to read transactions from.
-    :param output_topic: Topic to write risk alerts to.
-    :param checkpoint_location: Path to save checkpoints.
-    :return: The active StreamingQuery object.
+    :param bootstrap_servers: Kafka broker(s).
+    :param input_topic: Kafka topic with raw transactions.
+    :param output_topic: Kafka topic where risk alerts are published.
+    :param checkpoint_path: Filesystem path for checkpoint data.
+    :return: A StreamingQuery object for the running write stream.
     """
-    spark = create_spark_session()
-    transaction_schema = define_schema()
+    spark = get_spark_session()
+    schema = get_transaction_schema()
 
-    # Read from Kafka
-    parsed_stream = read_stream_from_kafka(
-        spark=spark,
-        kafka_bootstrap_servers=kafka_bootstrap_servers,
-        input_topic=input_topic,
-        schema=transaction_schema
-    )
-
-    # Process stream for risk analysis
-    risk_analysis_df = process_risk_analysis(parsed_stream)
-
-    # Write to Kafka
-    query = write_stream_to_kafka(
-        df=risk_analysis_df,
-        kafka_bootstrap_servers=kafka_bootstrap_servers,
-        output_topic=output_topic,
-        checkpoint_location=checkpoint_location
-    )
-
-    return query
-
-
-def main():
-    """
-    Main entry point to run the high-volume transaction streaming pipeline.
-    Includes basic error handling for the streaming query.
-    """
     try:
-        query = process_high_volume_transactions(
-            kafka_bootstrap_servers="kafka:9092",
-            input_topic="raw_transactions",
-            output_topic="risk_alerts",
-            checkpoint_location="/checkpoints/risk_alerts"
+        # Read raw Kafka data
+        raw_df = read_raw_transactions(
+            spark, 
+            bootstrap_servers=bootstrap_servers,
+            input_topic=input_topic
         )
-        query.awaitTermination()
-    except StreamingQueryException as e:
-        # Log and handle the streaming failure
-        print(f"Streaming query failed: {e}", file=sys.stderr)
-        sys.exit(1)
-    except KeyboardInterrupt:
-        # Graceful shutdown on Ctrl+C
-        print("Interrupted by user, shutting down...")
-        sys.exit(0)
+
+        # Parse and transform data
+        parsed_df = parse_transactions(raw_df, schema)
+
+        # Detect high-risk transactions
+        risk_df = detect_high_risk_transactions(parsed_df)
+
+        # Write high-risk transactions to Kafka
+        query = write_high_risk_transactions(
+            risk_df,
+            bootstrap_servers=bootstrap_servers,
+            output_topic=output_topic,
+            checkpoint_path=checkpoint_path
+        )
+
+        logging.info("Streaming query started successfully.")
+        return query
+
     except Exception as e:
-        # Catch any other unexpected errors
-        print(f"An unexpected error occurred: {e}", file=sys.stderr)
-        sys.exit(1)
-
-
-if __name__ == "__main__":
-    main()
+        logging.error("Failed to process high-volume transactions: %s", e, exc_info=True)
+        # In real-world usage, you might want to raise this or handle it further.
+        raise
