@@ -19,6 +19,9 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
+kafka_ex.py
+kafka_long.py
+
 
 # Virtual Environment
 venv/
