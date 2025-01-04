@@ -1,35 +1,40 @@
 import logging
 from pyspark.sql import DataFrame
-from config import Config
 from pyspark.sql.streaming import StreamingQuery
 
-def send_alerts_if_needed(risk_df: DataFrame) -> StreamingQuery:
+
+def _alert_on_batch(batch_df: DataFrame, batch_id: int) -> None:
     """
-    Demonstrates how to send alerts for high-risk transactions, 
-    and optionally push metrics to a monitoring system (e.g., Prometheus).
+    Handles alert logic for each micro-batch in the stream.
+
+    :param batch_df: The DataFrame corresponding to this micro-batch.
+    :param batch_id: The unique ID for this micro-batch.
     """
+    records = batch_df.collect()
+    for row in records:
+        alert_msg = (
+            f"[ALERT] High-risk transaction detected: "
+            f"User={row['user_id']} | Count={row['tx_count']} | Amount={row['total_amount']}"
+        )
+        # Log the alert message. 
+        # In a real scenario, you might send an HTTP request, Slack message, email, etc.
+        logging.warning(alert_msg)
 
-    def alert_batch_function(batch_df, batch_id):
-        """
-        Called for each micro-batch. Could also push metrics here.
-        """
-        records = batch_df.collect()
-        for row in records:
-            # Construct your alert message
-            alert_msg = (
-                f"[ALERT] High-risk transaction(s) detected: "
-                f"User={row['user_id']} | Count={row['tx_count']} | Amount={row['total_amount']}"
-            )
-            # In real scenario: call Slack, send an email, or an HTTP POST
-            logging.warning(alert_msg)
+        # Example of pushing a metric to a monitoring system (pseudo-code):
+        # pseudo_push_metric("high_risk_transactions_count", 1)
 
-            # Example of pushing a metric
-            # pseudo_code_push_metric("high_risk_transactions_count", 1)
 
-    # We return a StreamingQuery so the pipeline can track this output as well
+def start_high_risk_alert_stream(risk_df: DataFrame) -> StreamingQuery:
+    """
+    Starts a streaming job that sends alerts when high-risk transactions are detected.
+    Optionally, you could push metrics to your monitoring system here as well.
+
+    :param risk_df: A streaming DataFrame of transactions already identified as high-risk.
+    :return: A StreamingQuery that tracks the state of this alerting stream.
+    """
     return (
         risk_df
         .writeStream
-        .foreachBatch(alert_batch_function)
+        .foreachBatch(_alert_on_batch)
         .start()
     )
