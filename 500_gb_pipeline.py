@@ -90,6 +90,8 @@ if __name__ == '__main__':
 		"bootstrap_servers": "your_kafka_brokers:9092", # Replace with your brokers
 		"topic": "your_topic",  # Replace with your topic
 		"starting_offsets": "latest", # or 'earliest'
+		"database.history.kafka.bootstrap.servers": "kafka:9092",
+"database.history.kafka.topic": "schema-changes.inventory"
         # Add below lines if your kafka cluster need authentication
         #"security_protocol" : "SASL_SSL",
         #"sasl_mechanism" : "PLAIN",
