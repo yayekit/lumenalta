@@ -1,65 +1,67 @@
 import logging
 from logging_setup import setup_logging
 from spark_setup import get_spark_session
-from kafka_io import read_raw_transactions, write_high_risk_transactions
-from validation import parse_and_validate_transactions
-from aggregator import augment_with_user_profile, detect_high_risk_transactions
-from storage import persist_transactions_to_data_lake
-from alerting import send_alerts_if_needed
-from config import Config
+from kafka_io import KafkaIO
+from validation import TransactionValidator
+from aggregator import TransactionAggregator
+from alerting import AlertingService
+from storage import DataLakeWriter
+from schema import get_kafka_value_schema
 
 def main():
     """
-    Orchestrates the streaming pipeline:
-      1. Read raw transactions from Kafka
-      2. Parse & Validate
-      3. (Optionally) Augment data with user profiles
-      4. Persist to Data Lake
-      5. Detect high-risk transactions
-      6. Write high-risk to Kafka
-      7. Send external alerts
+    Main function to orchestrate the high-volume transaction processing pipeline.
+    Sets up logging, initializes Spark, reads from Kafka, validates transactions,
+    aggregates for risk detection, performs alerting, and persists data to the data lake.
     """
-    # 1. Setup logging
-    setup_logging()
-
-    logging.info("Starting the High-Volume Transaction Processing Pipeline...")
+    setup_logging(logging.INFO) # Initialize logging
+    logger = logging.getLogger(__name__)
+    logger.info("Starting High-Volume Transaction Processing Pipeline...")
 
     try:
-        # 2. Spark Session
-        spark = get_spark_session()
+        spark = get_spark_session() # Get Spark Session
 
-        # 3. Read from Kafka
-        raw_df = read_raw_transactions(spark)
+        kafka_io = KafkaIO(spark) # Initialize Kafka I/O handler
+        validator = TransactionValidator() # Initialize Transaction Validator
+        aggregator = TransactionAggregator() # Initialize Aggregator
+        alerter = AlertingService() # Initialize Alerting Service
+        data_lake_writer = DataLakeWriter() # Initialize Data Lake Writer
 
-        # 4. Parse & Validate
-        validated_df = parse_and_validate_transactions(raw_df)
 
-        # 5. (Optional) Join with user profile data
-        augmented_df = augment_with_user_profile(validated_df)
+        # 1. Read raw transactions from Kafka
+        kafka_value_schema = get_kafka_value_schema() # Schema for Kafka message value (JSON string)
+        raw_transactions_df = kafka_io.read_transactions_from_kafka(kafka_value_schema)
 
-        # 6. Persist validated & augmented data to data lake
-        lake_query = persist_transactions_to_data_lake(augmented_df)
+        # 2. Parse and Validate Transactions
+        validated_transactions_df = validator.process_transactions(raw_transactions_df)
 
-        # 7. Detect high-risk transactions
-        risk_df = detect_high_risk_transactions(augmented_df)
+        # 3. (Optional) Augment with User Profile Data - Placeholder Functionality
+        augmented_transactions_df = aggregator.augment_with_user_profile(validated_transactions_df)
 
-        # 8. Write high-risk events to Kafka
-        risk_query = write_high_risk_transactions(risk_df)
+        # 4. Persist Validated Transactions to Data Lake (via Kafka)
+        data_lake_kafka_query = kafka_io.write_data_lake_transactions_to_kafka(augmented_transactions_df)
 
-        # 9. Send external alerts (Slack, email, etc.) and push metrics
-        alert_query = send_alerts_if_needed(risk_df)
+        # 5. Detect High-Risk Transactions
+        high_risk_transactions_df = aggregator.detect_high_risk_transactions(augmented_transactions_df)
 
-        logging.info("All streaming queries have started.")
-        logging.info("Press Ctrl+C to terminate.")
-        
-        # Optionally block until termination. Otherwise, you can let them run indefinitely.
-        # risk_query.awaitTermination()
-        # lake_query.awaitTermination()
-        # alert_query.awaitTermination()
+        # 6. Alert on High-Risk Transactions
+        alert_stream_query = alerter.start_alert_stream(high_risk_transactions_df)
+
+        # 7. [For Direct Data Lake Write - Alternative, kept as comment for example - using Kafka Data Lake Stream is preferred in current version]
+        # data_lake_query = data_lake_writer.write_to_data_lake(augmented_transactions_df) # Direct write to Data Lake
+
+
+        logger.info("Pipeline setup complete, all streaming queries started.")
+        logger.info("Application is running, waiting for stream termination...")
+
+        # Await stream termination - choose which query to await on based on pipeline needs.
+        # For example, await on the alert stream, or data lake stream, or main data processing stream.
+        alert_stream_query.awaitTermination() # Awaiting alert stream termination for demonstration.
 
     except Exception as e:
-        logging.error("Pipeline encountered an error: %s", e, exc_info=True)
-        raise
+        logger.error(f"Pipeline encountered a critical error: {e}", exc_info=True)
+        raise # Re-raise exception to signal pipeline failure externally if needed
+
 
 if __name__ == "__main__":
     main()
